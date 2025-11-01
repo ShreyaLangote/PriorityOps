@@ -2,6 +2,9 @@
 
 An intelligent ticket management and prioritization system that uses AI agents to automatically detect duplicates, classify priorities, and manage escalations.
 
+## 🏆 Hackathon Submission
+This project was conceptualized and built for the **Super Hack Hackathon 2025**.
+
 ## 🏗️ Project Structure
 
 ```
