@@ -1,0 +1,144 @@
+{
+  "Comment": "PriorityOps Cognitive Workflow - AI-powered ticket processing pipeline",
+  "StartAt": "GetTicketDetails",
+  "TimeoutSeconds": 900,
+  "States": {
+    "GetTicketDetails": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:priorityops-get-ticket-details",
+      "Comment": "Retrieve complete ticket data from MongoDB Atlas",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Next": "DuplicateDetection",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "DuplicateDetection": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:priorityops-duplicate-detector",
+      "Comment": "Detect duplicate tickets using semantic similarity with Amazon Bedrock and OpenSearch",
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "AITriage",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "AITriage": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:priorityops-ai-triage",
+      "Comment": "Classify priority and generate solution recommendations using Claude 3 Sonnet",
+      "TimeoutSeconds": 180,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "UpdateTicket",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "UpdateTicket": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:priorityops-update-ticket",
+      "Comment": "Persist AI analysis results and audit trail to MongoDB",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        },
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Next": "WorkflowSuccess",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "WorkflowSuccess": {
+      "Type": "Pass",
+      "Comment": "Cognitive workflow completed successfully",
+      "Result": {
+        "status": "SUCCESS",
+        "message": "Ticket processed successfully through cognitive workflow"
+      },
+      "End": true
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Comment": "Send failure notification to operations team",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:priorityops-workflow-failures",
+        "Subject": "PriorityOps Cognitive Workflow Failure",
+        "Message.$": "$.error"
+      },
+      "Next": "WorkflowFailed"
+    },
+    "WorkflowFailed": {
+      "Type": "Fail",
+      "Comment": "The cognitive workflow failed after all retry attempts",
+      "Cause": "Workflow execution failed - check CloudWatch logs for details"
+    }
+  }
+}

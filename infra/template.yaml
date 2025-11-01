@@ -1,0 +1,296 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'PriorityOps - AI-Powered Ticket Management System'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  MongoDBSecretName:
+    Type: String
+    Default: priorityops/docdb
+    Description: Name of the secret containing MongoDB credentials
+  
+  OpenSearchDomainEndpoint:
+    Type: String
+    Description: OpenSearch Serverless collection endpoint
+  
+  NotificationEmail:
+    Type: String
+    Description: Email address for escalation notifications
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 300
+    MemorySize: 512
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        SECRET_ID: !Ref MongoDBSecretName
+        LOG_LEVEL: INFO
+
+Resources:
+  # Lambda Functions for Cognitive Workflow
+  GetTicketDetailsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'priorityops-get-ticket-details-${Environment}'
+      CodeUri: ../backend/agents/
+      Handler: get_ticket_details.lambda_handler
+      Description: 'Retrieves ticket details from MongoDB Atlas'
+      Policies:
+        - SecretsManagerReadWrite
+        - VPCAccessPolicy: {}
+      Environment:
+        Variables:
+          SECRET_ID: !Ref MongoDBSecretName
+
+  DuplicateDetectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'priorityops-duplicate-detector-${Environment}'
+      CodeUri: ../backend/agents/
+      Handler: duplicate_detector.lambda_handler
+      Description: 'Detects duplicate tickets using semantic similarity'
+      MemorySize: 1024
+      Timeout: 120
+      Policies:
+        - SecretsManagerReadWrite
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: 
+                - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1'
+        - Statement:
+            - Effect: Allow
+              Action:
+                - aoss:APIAccessAll
+              Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+      Environment:
+        Variables:
+          OPENSEARCH_HOST: !Ref OpenSearchDomainEndpoint
+
+  AITriageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'priorityops-ai-triage-${Environment}'
+      CodeUri: ../backend/agents/
+      Handler: ai_triage_agent.lambda_handler
+      Description: 'Classifies ticket priority using Claude 3 Sonnet'
+      MemorySize: 1024
+      Timeout: 180
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: 
+                - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0'
+
+  UpdateTicketFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'priorityops-update-ticket-${Environment}'
+      CodeUri: ../backend/agents/
+      Handler: update_ticket_agent.lambda_handler
+      Description: 'Updates ticket with AI analysis results'
+      Policies:
+        - SecretsManagerReadWrite
+      Environment:
+        Variables:
+          SECRET_ID: !Ref MongoDBSecretName
+
+  EscalationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'priorityops-escalation-agent-${Environment}'
+      CodeUri: ../backend/agents/
+      Handler: escalation_agent.lambda_handler
+      Description: 'Monitors and escalates overdue tickets'
+      Policies:
+        - SecretsManagerReadWrite
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt EscalationAlertsTopic.TopicName
+      Environment:
+        Variables:
+          SECRET_ID: !Ref MongoDBSecretName
+          SNS_TOPIC_ARN: !Ref EscalationAlertsTopic
+          SLA_HOURS: 1
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: rate(15 minutes)
+            Enabled: true
+
+  # Step Functions State Machine
+  CognitiveWorkflowStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub 'priorityops-cognitive-workflow-${Environment}'
+      DefinitionUri: cognitive_workflow.json
+      DefinitionSubstitutions:
+        GetTicketDetailsFunctionArn: !GetAtt GetTicketDetailsFunction.Arn
+        DuplicateDetectorFunctionArn: !GetAtt DuplicateDetectorFunction.Arn
+        AITriageFunctionArn: !GetAtt AITriageFunction.Arn
+        UpdateTicketFunctionArn: !GetAtt UpdateTicketFunction.Arn
+        EscalationAlertsTopicArn: !Ref EscalationAlertsTopic
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GetTicketDetailsFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DuplicateDetectorFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AITriageFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref UpdateTicketFunction
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt EscalationAlertsTopic.TopicName
+
+  # EventBridge Rule for Workflow Triggering
+  TicketCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'priorityops-ticket-created-${Environment}'
+      Description: 'Triggers cognitive workflow when tickets are created'
+      EventPattern:
+        source: ['priorityops.tickets']
+        detail-type: ['Ticket Created']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CognitiveWorkflowStateMachine.Arn
+          Id: 'CognitiveWorkflowTarget'
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+
+  # SNS Topic for Escalation Alerts
+  EscalationAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'priorityops-escalation-alerts-${Environment}'
+      DisplayName: 'PriorityOps Escalation Alerts'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # OpenSearch Serverless Collection
+  TicketVectorCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    Properties:
+      Name: !Sub 'priorityops-vectors-${Environment}'
+      Type: VECTORSEARCH
+      Description: 'Vector storage for ticket similarity search'
+
+  # IAM Roles
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !GetAtt CognitiveWorkflowStateMachine.Arn
+
+  # CloudWatch Log Groups
+  GetTicketDetailsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/priorityops-get-ticket-details-${Environment}'
+      RetentionInDays: 14
+
+  DuplicateDetectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/priorityops-duplicate-detector-${Environment}'
+      RetentionInDays: 14
+
+  AITriageLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/priorityops-ai-triage-${Environment}'
+      RetentionInDays: 14
+
+  UpdateTicketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/priorityops-update-ticket-${Environment}'
+      RetentionInDays: 14
+
+  EscalationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/priorityops-escalation-agent-${Environment}'
+      RetentionInDays: 14
+
+  # CloudWatch Alarms
+  WorkflowFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'priorityops-workflow-failures-${Environment}'
+      AlarmDescription: 'Alert when cognitive workflow executions fail'
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref CognitiveWorkflowStateMachine
+      AlarmActions:
+        - !Ref EscalationAlertsTopic
+
+Outputs:
+  CognitiveWorkflowArn:
+    Description: 'ARN of the Cognitive Workflow State Machine'
+    Value: !Ref CognitiveWorkflowStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitiveWorkflowArn'
+
+  EscalationTopicArn:
+    Description: 'ARN of the Escalation Alerts SNS Topic'
+    Value: !Ref EscalationAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-EscalationTopicArn'
+
+  OpenSearchCollectionArn:
+    Description: 'ARN of the OpenSearch Serverless Collection'
+    Value: !GetAtt TicketVectorCollection.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchCollectionArn'
+
+  GetTicketDetailsFunctionArn:
+    Description: 'ARN of the Get Ticket Details Lambda Function'
+    Value: !GetAtt GetTicketDetailsFunction.Arn
+
+  DuplicateDetectorFunctionArn:
+    Description: 'ARN of the Duplicate Detector Lambda Function'
+    Value: !GetAtt DuplicateDetectorFunction.Arn
+
+  AITriageFunctionArn:
+    Description: 'ARN of the AI Triage Lambda Function'
+    Value: !GetAtt AITriageFunction.Arn
+
+  UpdateTicketFunctionArn:
+    Description: 'ARN of the Update Ticket Lambda Function'
+    Value: !GetAtt UpdateTicketFunction.Arn
+
+  EscalationFunctionArn:
+    Description: 'ARN of the Escalation Lambda Function'
+    Value: !GetAtt EscalationFunction.Arn

@@ -1,0 +1,15 @@
+fastapi==0.119.0
+uvicorn==0.37.0
+boto3==1.40.53
+pydantic==2.12.2
+python-dotenv==1.1.1
+langchain==0.3.27
+langchain-core==0.3.79
+openai==2.4.0
+requests==2.32.5
+mangum==0.18.2
+pymongo==4.10.1
+motor==3.6.0
+sentence-transformers==3.3.1
+numpy==2.2.1
+scikit-learn==1.6.0
