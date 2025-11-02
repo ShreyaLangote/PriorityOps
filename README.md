@@ -37,7 +37,6 @@ PriorityOps/
 │   │   └── __init__.py
 │   ├── utils/                # Utility modules
 │   │   ├── database.py       # Async MongoDB utilities (Motor)
-│   │   ├── db.py            # Sync MongoDB utilities (pymongo + AWS Secrets)
 │   │   ├── events.py         # Event system for agent communication
 │   │   ├── llm_client.py     # LLM client for AI operations
 │   │   └── __init__.py
